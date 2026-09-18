@@ -18,6 +18,82 @@ check_root() {
     fi
 }
 
+# Парсинг полей DNAT из строки iptables -L / -S
+_parse_dnat_fields_from_line() {
+    local line="$1"
+    _dnat_port=$(echo "$line" | grep -oE '(dpt:|--dport )[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    _dnat_dest=$(echo "$line" | grep -oE '(to:|--to-destination )[0-9.]+:[0-9]+' | grep -oE '[0-9.]+:[0-9]+$' | head -1)
+    _dnat_proto=$(echo "$line" | grep -oE -- '-p (tcp|udp)' | awk '{print $2}')
+    if [[ -z "$_dnat_proto" ]]; then
+        _dnat_proto=$(echo "$line" | awk '{print $3}')
+        if [[ "$_dnat_proto" == "DNAT" ]]; then
+            _dnat_proto=$(echo "$line" | awk '{print $4}')
+        fi
+    fi
+    [[ -n "$_dnat_port" && -n "$_dnat_dest" && -n "$_dnat_proto" ]]
+}
+
+# Заполняет DNAT_MENU_NUM[i], DNAT_MENU_RECORD[i] (port|proto|dest) начиная с 1
+load_dnat_prerouting_menu() {
+    DNAT_MENU_NUM=()
+    DNAT_MENU_RECORD=()
+    local i=0 line num port proto dest
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[0-9] ]] || continue
+        [[ "$line" != *DNAT* ]] && continue
+        num="${line%% *}"
+        if ! _parse_dnat_fields_from_line "$line"; then
+            continue
+        fi
+        port="$_dnat_port"
+        proto="$_dnat_proto"
+        dest="$_dnat_dest"
+        ((i++))
+        DNAT_MENU_NUM[$i]="$num"
+        DNAT_MENU_RECORD[$i]="$port|$proto|$dest"
+    done < <(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null)
+
+    if [[ "$i" -eq 0 ]]; then
+        local idx=0
+        while IFS= read -r line; do
+            [[ "$line" != "-A PREROUTING"* ]] && continue
+            ((idx++))
+            [[ "$line" != *DNAT* ]] && continue
+            if ! _parse_dnat_fields_from_line "$line"; then
+                continue
+            fi
+            port="$_dnat_port"
+            proto="$_dnat_proto"
+            dest="$_dnat_dest"
+            ((i++))
+            DNAT_MENU_NUM[$i]="$idx"
+            DNAT_MENU_RECORD[$i]="$port|$proto|$dest"
+        done < <(iptables -t nat -S PREROUTING 2>/dev/null)
+    fi
+}
+
+dnat_prerouting_exists() {
+    local want_port=$1 want_proto=$2 want_dest=$3
+    load_dnat_prerouting_menu
+    local n record port proto dest
+    for n in "${!DNAT_MENU_RECORD[@]}"; do
+        record="${DNAT_MENU_RECORD[$n]}"
+        IFS='|' read -r port proto dest <<< "$record"
+        if [[ "$port" == "$want_port" && "$proto" == "$want_proto" && "$dest" == "$want_dest" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+remove_filter_rules_for_dnat() {
+    local d_proto=$1 d_port=$2 target_ip=$3 target_port=$4
+    while iptables -D INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -p "$d_proto" -d "$target_ip" --dport "$target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -p "$d_proto" -s "$target_ip" --sport "$target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
+}
+
 # --- ПОДГОТОВКА СИСТЕМЫ ---
 prepare_system() {
     # Автоматическое создание глобальной команды kaskad
@@ -193,11 +269,12 @@ apply_iptables_rules() {
 list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
     echo -e "${MAGENTA}ПОРТ (ВХОД)\tПРОТОКОЛ\tЦЕЛЬ (IP:ВЫХОД)${NC}"
-    iptables -t nat -S PREROUTING | grep "DNAT" | while read -r line ; do
-        l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
-        l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
-        l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        if [[ -n "$l_port" ]]; then echo -e "$l_port\t\t$l_proto\t\t$l_dest"; fi
+    load_dnat_prerouting_menu
+    local n record port proto dest
+    for n in $(printf '%s\n' "${!DNAT_MENU_RECORD[@]}" | sort -n); do
+        record="${DNAT_MENU_RECORD[$n]}"
+        IFS='|' read -r port proto dest <<< "$record"
+        echo -e "$port\t\t$proto\t\t$dest"
     done
     echo ""
 
@@ -207,39 +284,62 @@ list_active_rules() {
 # --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА ---
 delete_single_rule() {
     echo -e "\n${CYAN}--- Удаление правила ---${NC}"
-    declare -a RULES_LIST
-    local i=1
-    while read -r line; do
-        l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
-        l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
-        l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        if [[ -n "$l_port" ]]; then
-            RULES_LIST[$i]="$l_port:$l_proto:$l_dest"
-            echo -e "${YELLOW}[$i]${NC} Вход: $l_port ($l_proto) -> Выход: $l_dest"
-            ((i++))
-        fi
-    done < <(iptables -t nat -S PREROUTING | grep "DNAT")
+    load_dnat_prerouting_menu
 
-    if [ ${#RULES_LIST[@]} -eq 0 ]; then
+    if [[ ${#DNAT_MENU_RECORD[@]} -eq 0 ]]; then
         echo -e "${RED}Нет активных правил.${NC}"
         read -p "Нажмите Enter..."
         return
     fi
 
+    local n record port proto dest
+    for n in $(printf '%s\n' "${!DNAT_MENU_RECORD[@]}" | sort -n); do
+        record="${DNAT_MENU_RECORD[$n]}"
+        IFS='|' read -r port proto dest <<< "$record"
+        echo -e "${YELLOW}[$n]${NC} Вход: $port ($proto) -> Выход: $dest"
+    done
+
     echo ""
     read -p "Номер правила для удаления (0 отмена): " rule_num
-    if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
+    if [[ "$rule_num" == "0" || -z "${DNAT_MENU_RECORD[$rule_num]}" ]]; then return; fi
 
-    # Разбираем строку
-    IFS=':' read -r d_port d_proto d_dest <<< "${RULES_LIST[$rule_num]}"
+    IFS='|' read -r d_port d_proto d_dest <<< "${DNAT_MENU_RECORD[$rule_num]}"
+    local chain_num="${DNAT_MENU_NUM[$rule_num]}"
     local target_ip="${d_dest%:*}"
-    local target_port="${d_dest#*:}"
-    
-    iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null
-    iptables -D INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$d_proto" -d "$target_ip" --dport "$target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$d_proto" -s "$target_ip" --sport "$target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    
+    local target_port="${d_dest##*:}"
+
+    if ! iptables -t nat -D PREROUTING "$chain_num" 2>/dev/null; then
+        echo -e "${RED}[ERROR] Не удалось снять DNAT (номер в цепочке: $chain_num).${NC}"
+        echo -e "${YELLOW}Проверка: iptables -t nat -L PREROUTING --line-numbers -n${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    if dnat_prerouting_exists "$d_port" "$d_proto" "$d_dest"; then
+        echo -e "${YELLOW}[!] В PREROUTING осталось ещё одно такое же правило — удаляю...${NC}"
+        while dnat_prerouting_exists "$d_port" "$d_proto" "$d_dest"; do
+            load_dnat_prerouting_menu
+            local dup_num dup_chain
+            for dup_num in "${!DNAT_MENU_RECORD[@]}"; do
+                record="${DNAT_MENU_RECORD[$dup_num]}"
+                IFS='|' read -r port proto dest <<< "$record"
+                if [[ "$port" == "$d_port" && "$proto" == "$d_proto" && "$dest" == "$d_dest" ]]; then
+                    dup_chain="${DNAT_MENU_NUM[$dup_num]}"
+                    iptables -t nat -D PREROUTING "$dup_chain" 2>/dev/null || break
+                    break
+                fi
+            done
+        done
+    fi
+
+    if dnat_prerouting_exists "$d_port" "$d_proto" "$d_dest"; then
+        echo -e "${RED}[ERROR] Правило DNAT всё ещё в ядре. Удалите вручную по номеру из -L.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    remove_filter_rules_for_dnat "$d_proto" "$d_port" "$target_ip" "$target_port"
+
     netfilter-persistent save > /dev/null
     echo -e "${GREEN}[OK] Правило удалено.${NC}"
     read -p "Нажмите Enter..."
