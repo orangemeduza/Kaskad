@@ -7,20 +7,9 @@ CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
-BLUE='\033[0;34m'
 NC='\033[0m'
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-
-type_text() {
-    local text="$1"
-    local delay=0.03
-    for (( i=0; i<${#text}; i++ )); do
-        echo -n "${text:$i:1}"
-        sleep $delay
-    done
-    echo ""
-}
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -31,10 +20,14 @@ check_root() {
 
 # --- ПОДГОТОВКА СИСТЕМЫ ---
 prepare_system() {
-    # Автоматическое создание глобальной команды gokaskad
-    if [ "$0" != "/usr/local/bin/gokaskad" ]; then
-        cp -f "$0" "/usr/local/bin/gokaskad"
-        chmod +x "/usr/local/bin/gokaskad"
+    # Автоматическое создание глобальной команды kaskad
+    if [ -x "/usr/local/bin/gokaskad" ]; then
+        rm -f "/usr/local/bin/gokaskad"
+        echo -e "${CYAN}[*] Удалена устаревшая команда gokaskad (используйте kaskad).${NC}" >&2
+    fi
+    if [ "$0" != "/usr/local/bin/kaskad" ]; then
+        cp -f "$0" "/usr/local/bin/kaskad"
+        chmod +x "/usr/local/bin/kaskad"
     fi
 
     # Включение IP Forwarding
@@ -57,49 +50,8 @@ prepare_system() {
     export DEBIAN_FRONTEND=noninteractive
     if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
         apt-get update -y > /dev/null
-        apt-get install -y iptables-persistent netfilter-persistent qrencode > /dev/null
+        apt-get install -y iptables-persistent netfilter-persistent > /dev/null
     fi
-}
-
-# --- ПРОМО БЛОК ---
-show_promo() {
-    clear
-    echo ""
-    echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}║         ХОСТИНГ, КОТОРЫЙ РАБОТАЕТ СО СКИДКОЙ ДО -60%         ║${NC}"
-    echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-
-    echo -e "${CYAN}🌍 ЛОКАЦИИ: РФ И ЕВРОПА${NC}"
-    echo -e "${WHITE}  >>> https://vk.cc/ct29NQ${NC}"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "OFF60" "60% скидка на первый месяц"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "antenka20" "Буст 20% + 3% (при оплате за 3 мес)"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "antenka6" "Буст 15% + 5% (при оплате за 6 мес)"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "antenka12" "Буст 5% + 5% (при оплате за 12 мес)"
-
-    echo -e "\n${CYAN}🇧🇾 ЛОКАЦИЯ: БЕЛАРУСЬ${NC}"
-    echo -e "${WHITE}  >>> https://vk.cc/cUxAhj${NC}"
-    printf "  ${YELLOW}%-12s${NC} : ${WHITE}%s${NC}\n" "OFF60" "60% скидка на первый месяц"
-
-    echo ""
-    echo -e "\n${YELLOW}Генерация QR-кода основного партнера... (3 сек)${NC}"
-    for i in {3..1}; do
-        echo -ne "$i..."
-        sleep 1
-    done
-    echo ""
-
-    echo -e "\n${WHITE}" 
-    if command -v qrencode &> /dev/null; then
-        qrencode -t ANSIUTF8 "https://vk.cc/ct29NQ"
-    else
-        echo "QR-код не загрузился, используйте ссылки выше."
-    fi
-    echo -e "${NC}"
-    
-    echo -e "${GREEN}Сканируйте камерой телефона!${NC}"
-    echo ""
-    read -p "Нажмите enter для настройки каскадного скрипта..."
 }
 
 # --- ИНСТРУКЦИЯ (ТЕКСТ ВНУТРИ КОДА) ---
@@ -248,14 +200,6 @@ list_active_rules() {
         if [[ -n "$l_port" ]]; then echo -e "$l_port\t\t$l_proto\t\t$l_dest"; fi
     done
     echo ""
-    
-    echo -e "${GREEN}💰 Задонатить каналу и автору:${NC}"
-    if command -v qrencode &> /dev/null; then
-        qrencode -t ANSIUTF8 "https://pay.cloudtips.ru/p/7410814f"
-    else
-        echo "https://pay.cloudtips.ru/p/7410814f"
-    fi
-    echo ""
 
     read -p "Нажмите Enter..."
 }
@@ -324,20 +268,10 @@ flush_rules() {
 show_menu() {
     while true; do
         clear
-        echo -e "${MAGENTA}"
-        echo "******************************************************"
-        echo "       anten-ka канал представляет..."
-        echo "       YouTube: https://www.youtube.com/@antenkaru"
-        echo "******************************************************"
-        echo -e "${NC}"
-        
-        echo -e "${YELLOW}Получить инструкции:${NC}"
-        echo -e "1 способ: ${BLUE}https://boosty.to/anten-ka${NC}"
-        echo -e "2 способ: ${BLUE}https://antenka.taplink.ws${NC}"
-        echo -e "3 способ: ${BLUE}https://web.tribute.tg/p/cJu${NC}"
+        echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${MAGENTA}║              Kaskad — NAT переадресация (каскад)              ║${NC}"
+        echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "${GREEN}💰 Задонатить каналу и автору:${NC} https://pay.cloudtips.ru/p/7410814f"
-        echo -e "------------------------------------------------------"
         
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
         echo -e "2) Настроить ${CYAN}VLESS / XRay${NC} (TCP)"
@@ -346,8 +280,7 @@ show_menu() {
         echo -e "5) Посмотреть активные правила"
         echo -e "6) ${RED}Удалить одно правило${NC}"
         echo -e "7) ${RED}Сбросить ВСЕ настройки${NC}"
-        echo -e "8) ${YELLOW}Показать PROMO${NC}"
-        echo -e "9) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
+        echo -e "8) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -360,8 +293,7 @@ show_menu() {
             5) list_active_rules ;;
             6) delete_single_rule ;;
             7) flush_rules ;;
-            8) show_promo ;;
-            9) show_instructions ;;
+            8) show_instructions ;;
             0) exit 0 ;;
             *) ;;
         esac
@@ -371,5 +303,4 @@ show_menu() {
 # --- ЗАПУСК ---
 check_root
 prepare_system
-show_promo
 show_menu
