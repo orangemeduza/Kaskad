@@ -25,7 +25,6 @@ delete_dnat_by_spec() {
     local target_dest="$3"
     local deleted_any=0
 
-    # Читаем правила во временный массив, чтобы избежать проблем с дескрипторами при вызове iptables
     local raw_lines=()
     while IFS= read -r line; do
         raw_lines+=("$line")
@@ -41,7 +40,6 @@ delete_dnat_by_spec() {
         p_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
 
         if [[ "$p_port" == "$target_port" && "$p_proto" == "$target_proto" && "$p_dest" == "$target_dest" ]]; then
-            # Отрезаем "-A PREROUTING " и передаем аргументы напрямую в iptables -t nat -D PREROUTING
             local rule_args="${line#-A PREROUTING }"
             if [ -n "$rule_args" ]; then
                 eval "iptables -t nat -D PREROUTING $rule_args" 2>/dev/null && deleted_any=1
@@ -89,9 +87,12 @@ prepare_system() {
 
     # Установка зависимостей
     export DEBIAN_FRONTEND=noninteractive
-    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+    local pkgs_needed=()
+    dpkg -s iptables-persistent >/dev/null 2>&1 || pkgs_needed+=("iptables-persistent" "netfilter-persistent")
+    dpkg -s socat               >/dev/null 2>&1 || pkgs_needed+=("socat")
+    if [ ${#pkgs_needed[@]} -gt 0 ]; then
         apt-get update -y > /dev/null
-        apt-get install -y iptables-persistent netfilter-persistent > /dev/null
+        apt-get install -y "${pkgs_needed[@]}" > /dev/null
     fi
 }
 
@@ -117,6 +118,11 @@ show_instructions() {
     echo -e "2. В настройках соединения найдите поле ${YELLOW}Endpoint / Адрес сервера${NC}."
     echo -e "3. Замените зарубежный IP на ${GREEN}IP ЭТОГО СЕРВЕРА${NC}."
     echo -e "4. Если вы использовали разные порты в правиле №4, укажите Входящий порт."
+    echo ""
+    echo -e "${CYAN}IPv4→IPv6 relay (socat):${NC}"
+    echo -e "Используйте пункт ${GREEN}5${NC} если конечный сервер доступен только по IPv6."
+    echo -e "Трафик: Клиент (IPv4) → этот VPS → конечный сервер (IPv6)."
+    echo -e "Relay работает как systemd-сервис и стартует автоматически при перезагрузке."
     echo ""
     echo -e "${GREEN}Готово! Теперь трафик идет: Клиент -> Этот Сервер -> Зарубеж.${NC}"
     echo ""
@@ -208,7 +214,7 @@ apply_iptables_rules() {
     # Новые правила
     iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
     iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
-    
+
     if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
     fi
@@ -217,22 +223,22 @@ apply_iptables_rules() {
     iptables -A FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT
 
     # Настройка UFW если активен
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$IN_PORT"/"$PROTO" >/dev/null
+    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+        ufw allow "$IN_PORT"/"$PROTO" > /dev/null
         sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-        ufw reload >/dev/null
+        ufw reload > /dev/null
     fi
 
     netfilter-persistent save > /dev/null
-    
+
     echo -e "${GREEN}[SUCCESS] $NAME настроен!${NC}"
     echo -e "$PROTO: Вход $IN_PORT -> Выход $TARGET_IP:$OUT_PORT"
     read -p "Нажмите Enter для возврата в меню..."
 }
 
-# --- СПИСОК ПРАВИЛ ---
+# --- СПИСОК ПРАВИЛ (iptables) ---
 list_active_rules() {
-    echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
+    echo -e "\n${CYAN}--- Активные переадресации (iptables) ---${NC}"
     echo -e "${MAGENTA}ПОРТ (ВХОД)\tПРОТОКОЛ\tЦЕЛЬ (IP:ВЫХОД)${NC}"
     iptables -t nat -S PREROUTING 2>/dev/null | grep "DNAT" | while read -r line ; do
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
@@ -241,11 +247,10 @@ list_active_rules() {
         if [[ -n "$l_port" ]]; then echo -e "$l_port\t\t$l_proto\t\t$l_dest"; fi
     done
     echo ""
-
     read -p "Нажмите Enter..."
 }
 
-# --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА ---
+# --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА (iptables) ---
 delete_single_rule() {
     echo -e "\n${CYAN}--- Удаление правила ---${NC}"
     declare -a RULES_LIST
@@ -279,11 +284,9 @@ delete_single_rule() {
     local target_port="${d_dest##*:}"
 
     if ! delete_dnat_by_spec "$d_port" "$d_proto" "$d_dest"; then
-        # Резервная попытка стандартной командой
         iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null
     fi
 
-    # На случай, если было добавлено с -i IFACE (как на вашем сервере ens3):
     local iface
     iface=$(ip route get 8.8.8.8 2>/dev/null | awk -- '{printf $5}')
     if [[ -n "$iface" ]]; then
@@ -317,7 +320,207 @@ flush_rules() {
     read -p "Нажмите Enter..."
 }
 
+# ===========================================================================
+# --- SOCAT IPv4 -> IPv6 RELAY ---
+# ===========================================================================
+
+# Имя systemd-сервиса по параметрам
+_socat_svc_name() {
+    local proto=$1 in_port=$2
+    echo "kaskad-socat-${proto}-${in_port}"
+}
+
+# Создать и запустить systemd-сервис для socat relay
+configure_socat_relay() {
+    echo -e "\n${CYAN}--- 🌐 socat relay: IPv4 → IPv6 ---${NC}"
+    echo -e "${WHITE}Клиент подключается по IPv4, трафик уходит на IPv6-адрес конечного сервера.${NC}\n"
+
+    # Протокол
+    local PROTO
+    while true; do
+        echo -e "Выберите протокол (${YELLOW}udp${NC} или ${YELLOW}tcp${NC}):"
+        read -p "> " PROTO
+        if [[ "$PROTO" == "udp" || "$PROTO" == "tcp" ]]; then break; fi
+        echo -e "${RED}Ошибка: введите udp или tcp!${NC}"
+    done
+
+    # Входящий порт (IPv4)
+    local IN_PORT
+    while true; do
+        echo -e "Введите ${YELLOW}ВХОДЯЩИЙ Порт${NC} (на этом сервере, IPv4):"
+        read -p "> " IN_PORT
+        if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && [ "$IN_PORT" -le 65535 ]; then break; fi
+        echo -e "${RED}Ошибка: порт должен быть числом (1-65535)!${NC}"
+    done
+
+    # IPv6-адрес назначения
+    local TARGET_IPV6
+    while true; do
+        echo -e "Введите ${YELLOW}IPv6-адрес${NC} конечного сервера (без скобок, например: 2a01:dead:beef::1):"
+        read -p "> " TARGET_IPV6
+        if [[ -n "$TARGET_IPV6" ]]; then break; fi
+        echo -e "${RED}Ошибка: адрес не может быть пустым!${NC}"
+    done
+
+    # Исходящий порт (IPv6)
+    local OUT_PORT
+    while true; do
+        echo -e "Введите ${YELLOW}ИСХОДЯЩИЙ Порт${NC} на конечном сервере (IPv6):"
+        read -p "> " OUT_PORT
+        if [[ "$OUT_PORT" =~ ^[0-9]+$ ]] && [ "$OUT_PORT" -le 65535 ]; then break; fi
+        echo -e "${RED}Ошибка: порт должен быть числом (1-65535)!${NC}"
+    done
+
+    local SVC_NAME
+    SVC_NAME=$(_socat_svc_name "$PROTO" "$IN_PORT")
+    local SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
+
+    # Если сервис уже есть — остановить и пересоздать
+    if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
+        echo -e "${YELLOW}[*] Останавливаю существующий relay на порту $IN_PORT...${NC}"
+        systemctl stop "$SVC_NAME"
+        systemctl disable "$SVC_NAME" 2>/dev/null
+    fi
+
+    # Формируем socat-аргументы в зависимости от протокола
+    local SOCAT_LISTEN SOCAT_TARGET
+    if [[ "$PROTO" == "udp" ]]; then
+        # fork — один процесс на каждый новый UDP-«поток» (по source addr:port)
+        SOCAT_LISTEN="UDP4-LISTEN:${IN_PORT},reuseaddr,fork"
+        SOCAT_TARGET="UDP6:[${TARGET_IPV6}]:${OUT_PORT}"
+    else
+        SOCAT_LISTEN="TCP4-LISTEN:${IN_PORT},reuseaddr,fork"
+        SOCAT_TARGET="TCP6:[${TARGET_IPV6}]:${OUT_PORT}"
+    fi
+
+    # Создаём systemd unit
+    cat > "$SVC_FILE" <<EOF
+[Unit]
+Description=Kaskad socat relay ${PROTO^^} IPv4:${IN_PORT} -> IPv6:[${TARGET_IPV6}]:${OUT_PORT}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat ${SOCAT_LISTEN} ${SOCAT_TARGET}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Открываем порт в firewall
+    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+        ufw allow "${IN_PORT}/${PROTO}" > /dev/null
+        echo -e "${CYAN}[*] UFW: открыт порт ${IN_PORT}/${PROTO}${NC}"
+    else
+        # iptables: разрешить входящий трафик
+        iptables -C INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null \
+            || iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
+        netfilter-persistent save > /dev/null
+    fi
+
+    # Запускаем
+    systemctl daemon-reload
+    systemctl enable "$SVC_NAME" > /dev/null 2>&1
+    systemctl start "$SVC_NAME"
+
+    sleep 1
+    if systemctl is-active --quiet "$SVC_NAME"; then
+        echo -e "${GREEN}[SUCCESS] socat relay запущен!${NC}"
+        echo -e "  Протокол : ${CYAN}${PROTO^^}${NC}"
+        echo -e "  Вход     : ${CYAN}0.0.0.0:${IN_PORT} (IPv4)${NC}"
+        echo -e "  Выход    : ${CYAN}[${TARGET_IPV6}]:${OUT_PORT} (IPv6)${NC}"
+        echo -e "  Сервис   : ${YELLOW}${SVC_NAME}${NC}"
+        echo -e "  Статус   : $(systemctl is-active "$SVC_NAME")"
+    else
+        echo -e "${RED}[ERROR] Сервис не запустился. Лог:${NC}"
+        journalctl -u "$SVC_NAME" -n 20 --no-pager
+    fi
+
+    read -p "Нажмите Enter для возврата в меню..."
+}
+
+# --- СПИСОК ACTIVE SOCAT RELAY'ОВ ---
+list_socat_relays() {
+    echo -e "\n${CYAN}--- Активные socat relay'ы ---${NC}"
+    local found=0
+    for svc_file in /etc/systemd/system/kaskad-socat-*.service; do
+        [[ -f "$svc_file" ]] || continue
+        local svc_name
+        svc_name=$(basename "$svc_file" .service)
+        local desc status
+        desc=$(grep -oP '(?<=Description=).*' "$svc_file" | head -1)
+        status=$(systemctl is-active "$svc_name" 2>/dev/null)
+        local color="${GREEN}"
+        [[ "$status" != "active" ]] && color="${RED}"
+        echo -e "  ${color}●${NC} ${YELLOW}${svc_name}${NC}  [${color}${status}${NC}]"
+        echo -e "    ${desc}"
+        found=1
+    done
+    if [ "$found" -eq 0 ]; then
+        echo -e "  ${YELLOW}Нет настроенных socat relay'ов.${NC}"
+    fi
+    echo ""
+    read -p "Нажмите Enter..."
+}
+
+# --- УДАЛЕНИЕ SOCAT RELAY'А ---
+delete_socat_relay() {
+    echo -e "\n${CYAN}--- Удаление socat relay ---${NC}"
+
+    local svcs=()
+    for svc_file in /etc/systemd/system/kaskad-socat-*.service; do
+        [[ -f "$svc_file" ]] || continue
+        svcs+=("$(basename "$svc_file" .service)")
+    done
+
+    if [ ${#svcs[@]} -eq 0 ]; then
+        echo -e "${RED}Нет настроенных socat relay'ов.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    local i=1
+    for svc in "${svcs[@]}"; do
+        local desc status
+        desc=$(grep -oP '(?<=Description=).*' "/etc/systemd/system/${svc}.service" | head -1)
+        status=$(systemctl is-active "$svc" 2>/dev/null)
+        echo -e "${YELLOW}[$i]${NC} ${svc}  [${status}]  ${desc}"
+        ((i++))
+    done
+    echo ""
+    read -p "Номер для удаления (0 — отмена): " choice
+    if [[ "$choice" == "0" || -z "${svcs[$((choice-1))]}" ]]; then return; fi
+
+    local target_svc="${svcs[$((choice-1))]}"
+
+    # Извлекаем порт и протокол из имени сервиса: kaskad-socat-<proto>-<port>
+    local proto in_port
+    proto=$(echo "$target_svc" | grep -oP '(?<=kaskad-socat-)\w+(?=-\d+$)')
+    in_port=$(echo "$target_svc" | grep -oP '\d+$')
+
+    systemctl stop "$target_svc" 2>/dev/null
+    systemctl disable "$target_svc" 2>/dev/null
+    rm -f "/etc/systemd/system/${target_svc}.service"
+    systemctl daemon-reload
+
+    # Убрать iptables-правило для входящего порта (если добавляли)
+    if [[ -n "$proto" && -n "$in_port" ]]; then
+        while iptables -D INPUT -p "$proto" --dport "$in_port" -j ACCEPT 2>/dev/null; do :; done
+        netfilter-persistent save > /dev/null 2>&1
+    fi
+
+    echo -e "${GREEN}[OK] Relay ${target_svc} удалён.${NC}"
+    read -p "Нажмите Enter..."
+}
+
+# ===========================================================================
 # --- МЕНЮ ---
+# ===========================================================================
 show_menu() {
     while true; do
         clear
@@ -325,30 +528,39 @@ show_menu() {
         echo -e "${MAGENTA}║              Kaskad — NAT переадресация (каскад)              ║${NC}"
         echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        
+        echo -e "${CYAN}── iptables (IPv4→IPv4) ──────────────────────────────────────${NC}"
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
         echo -e "2) Настроить ${CYAN}VLESS / XRay${NC} (TCP)"
         echo -e "3) Настроить ${CYAN}TProxy / MTProto${NC} (TCP)"
         echo -e "4) 🛠 Создать ${YELLOW}Кастомное правило${NC} (Разные порты, SSH, RDP...)"
-        echo -e "5) Посмотреть активные правила"
-        echo -e "6) ${RED}Удалить одно правило${NC}"
-        echo -e "7) ${RED}Сбросить ВСЕ настройки${NC}"
-        echo -e "8) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}"
-        echo -e "0) Выход"
-        echo -e "------------------------------------------------------"
+        echo -e "5) Посмотреть активные правила (iptables)"
+        echo -e "6) ${RED}Удалить одно правило (iptables)${NC}"
+        echo -e "7) ${RED}Сбросить ВСЕ правила iptables${NC}"
+        echo ""
+        echo -e "${CYAN}── socat relay (IPv4→IPv6) ───────────────────────────────────${NC}"
+        echo -e "8) 🌐 Добавить ${GREEN}socat relay${NC} (IPv4 вход → IPv6 выход)"
+        echo -e "9) Список активных ${GREEN}socat relay${NC}'ов"
+        echo -e "10) ${RED}Удалить socat relay${NC}"
+        echo ""
+        echo -e "11) ${MAGENTA}📚 ИНСТРУКЦИЯ${NC}"
+        echo -e "0)  Выход"
+        echo -e "──────────────────────────────────────────────────────────────"
         read -p "Ваш выбор: " choice
 
         case $choice in
-            1) configure_rule "udp" "AmneziaWG" ;;
-            2) configure_rule "tcp" "VLESS" ;;
-            3) configure_rule "tcp" "MTProto/TProxy" ;;
-            4) configure_custom_rule ;;
-            5) list_active_rules ;;
-            6) delete_single_rule ;;
-            7) flush_rules ;;
-            8) show_instructions ;;
-            0) exit 0 ;;
-            *) ;;
+            1)  configure_rule "udp" "AmneziaWG" ;;
+            2)  configure_rule "tcp" "VLESS" ;;
+            3)  configure_rule "tcp" "MTProto/TProxy" ;;
+            4)  configure_custom_rule ;;
+            5)  list_active_rules ;;
+            6)  delete_single_rule ;;
+            7)  flush_rules ;;
+            8)  configure_socat_relay ;;
+            9)  list_socat_relays ;;
+            10) delete_socat_relay ;;
+            11) show_instructions ;;
+            0)  exit 0 ;;
+            *)  ;;
         esac
     done
 }
